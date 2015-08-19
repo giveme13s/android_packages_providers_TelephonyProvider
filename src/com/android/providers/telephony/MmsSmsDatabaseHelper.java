@@ -29,8 +29,10 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteException;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.provider.BaseColumns;
 import android.provider.Telephony;
@@ -42,6 +44,7 @@ import android.provider.Telephony.Mms.Addr;
 import android.provider.Telephony.Mms.Part;
 import android.provider.Telephony.Mms.Rate;
 import android.provider.Telephony.MmsSms.PendingMessages;
+import android.telephony.SubscriptionManager;
 import android.util.Log;
 
 import com.google.android.mms.pdu.EncodedStringValue;
@@ -73,19 +76,6 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                         "        AND (m_type=132 OR m_type=130 OR m_type=128)" +
                         "        AND " + Mms.MESSAGE_BOX + " != 3) " +
                         "  WHERE threads._id = new.thread_id; ";
-
-    private static final String UPDATE_THREAD_COUNT_ON_OLD =
-                        "  UPDATE threads SET message_count = " +
-                        "     (SELECT COUNT(sms._id) FROM sms LEFT JOIN threads " +
-                        "      ON threads._id = " + Sms.THREAD_ID +
-                        "      WHERE " + Sms.THREAD_ID + " = old.thread_id" +
-                        "        AND sms." + Sms.TYPE + " != 3) + " +
-                        "     (SELECT COUNT(pdu._id) FROM pdu LEFT JOIN threads " +
-                        "      ON threads._id = " + Mms.THREAD_ID +
-                        "      WHERE " + Mms.THREAD_ID + " = old.thread_id" +
-                        "        AND (m_type=132 OR m_type=130 OR m_type=128)" +
-                        "        AND " + Mms.MESSAGE_BOX + " != 3) " +
-                        "  WHERE threads._id = old.thread_id; ";
 
     private static final String SMS_UPDATE_THREAD_DATE_SNIPPET_COUNT_ON_UPDATE =
                         "BEGIN" +
@@ -136,21 +126,6 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                         PDU_UPDATE_THREAD_READ_BODY +
                         "END;";
 
-    private static final String UPDATE_THREAD_SNIPPET_SNIPPET_CS_ON_DELETE =
-                        "  UPDATE threads SET snippet = " +
-                        "   (SELECT snippet FROM" +
-                        "     (SELECT date * 1000 AS date, sub AS snippet, thread_id FROM pdu" +
-                        "      UNION SELECT date, body AS snippet, thread_id FROM sms)" +
-                        "    WHERE thread_id = OLD.thread_id ORDER BY date DESC LIMIT 1) " +
-                        "  WHERE threads._id = OLD.thread_id; " +
-                        "  UPDATE threads SET snippet_cs = " +
-                        "   (SELECT snippet_cs FROM" +
-                        "     (SELECT date * 1000 AS date, sub_cs AS snippet_cs, thread_id FROM pdu" +
-                        "      UNION SELECT date, 0 AS snippet_cs, thread_id FROM sms)" +
-                        "    WHERE thread_id = OLD.thread_id ORDER BY date DESC LIMIT 1) " +
-                        "  WHERE threads._id = OLD.thread_id; ";
-
-
     // When a part is inserted, if it is not text/plain or application/smil
     // (which both can exist with text-only MMSes), then there is an attachment.
     // Set has_attachment=1 in the threads table for the thread in question.
@@ -176,28 +151,6 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                         "     WHERE part._id=new._id LIMIT 1); " +
                         " END";
 
-
-    // When a part is deleted (with the same non-text/SMIL constraint as when
-    // we set has_attachment), update the threads table for all threads.
-    // Unfortunately we cannot update only the thread that the part was
-    // attached to, as it is possible that the part has been orphaned and
-    // the message it was attached to is already gone.
-    private static final String PART_UPDATE_THREADS_ON_DELETE_TRIGGER =
-                        "CREATE TRIGGER update_threads_on_delete_part " +
-                        " AFTER DELETE ON part " +
-                        " WHEN old.ct != 'text/plain' AND old.ct != 'application/smil' " +
-                        " BEGIN " +
-                        "  UPDATE threads SET has_attachment = " +
-                        "   CASE " +
-                        "    (SELECT COUNT(*) FROM part JOIN pdu " +
-                        "     WHERE pdu.thread_id = threads._id " +
-                        "     AND part.ct != 'text/plain' AND part.ct != 'application/smil' " +
-                        "     AND part.mid = pdu._id)" +
-                        "   WHEN 0 THEN 0 " +
-                        "   ELSE 1 " +
-                        "   END; " +
-                        " END";
-
     // When the 'thread_id' column in the pdu table is updated, we need to run the trigger to update
     // the threads table's has_attachment column, if the message has an attachment in 'part' table
     private static final String PDU_UPDATE_THREADS_ON_UPDATE_TRIGGER =
@@ -210,12 +163,45 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                         "     AND part.mid = pdu._id);" +
                         " END";
 
+    private static final String TRIGGER_GET_UNREAD_COUNT_ON_INSERT =
+            "CREATE TRIGGER update_unread_count_on_insert_sms " +
+            " AFTER INSERT ON sms " +
+            " BEGIN " +
+            "  UPDATE threads SET " +
+                 Threads.UNREAD_MESSAGE_COUNT + "=(" +
+            "      SELECT count(_id) FROM sms WHERE read = 0" +
+            "          AND thread_id = new.thread_id" +
+            "    ) WHERE threads._id = new.thread_id;" +
+            " END";
+
+    private static final String TRIGGER_GET_UNREAD_COUNT_ON_UPDATE =
+            "CREATE TRIGGER update_unread_count_on_update_sms " +
+            " AFTER UPDATE ON sms " +
+            " BEGIN " +
+            "  UPDATE threads SET " +
+                 Threads.UNREAD_MESSAGE_COUNT + "=(" +
+            "      SELECT count(_id) FROM sms WHERE read = 0" +
+            "          AND thread_id = new.thread_id" +
+            "    ) WHERE threads._id = new.thread_id;" +
+            " END";
+
+    private static final String TRIGGER_GET_UNREAD_COUNT_ON_DELETE =
+            "CREATE TRIGGER update_unread_count_on_delete_sms" +
+            " AFTER DELETE ON sms " +
+            " BEGIN " +
+            "  UPDATE threads SET " +
+                 Threads.UNREAD_MESSAGE_COUNT + "=(" +
+            "      SELECT count(_id) FROM sms WHERE read = 0" +
+            "          AND thread_id = old.thread_id" +
+            "    ) WHERE threads._id = old.thread_id;" +
+            " END";
+
     private static MmsSmsDatabaseHelper sInstance = null;
     private static boolean sTriedAutoIncrement = false;
     private static boolean sFakeLowStorageTest = false;     // for testing only
 
     static final String DATABASE_NAME = "mmssms.db";
-    static final int DATABASE_VERSION = 62;
+    static final int DATABASE_VERSION = 65;
     private final Context mContext;
     private LowStorageMonitor mLowStorageMonitor;
 
@@ -266,15 +252,16 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                         }
                     }
                     // Now build a selection string of all the unique recipient ids
-                    StringBuilder sb = new StringBuilder();
+                    StringBuilder sb = new StringBuilder("_id not in (");
                     Iterator<Integer> iter = recipientIds.iterator();
                     while (iter.hasNext()) {
-                        sb.append("_id != " + iter.next());
+                        sb.append(iter.next());
                         if (iter.hasNext()) {
-                            sb.append(" AND ");
+                            sb.append(",");
                         }
                     }
-                    if (sb.length() > 0) {
+                    sb.append(")");
+                    if (recipientIds.size() > 0) {
                         int rows = db.delete("canonical_addresses", sb.toString(), null);
                     }
                 }
@@ -384,6 +371,54 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
         }
     }
 
+    private static void updateThreadDate(SQLiteDatabase db, long thread_id) {
+        if (thread_id <= 0) {
+            return;
+        }
+
+        try {
+            db.execSQL(
+            "  UPDATE threads" +
+            "  SET" +
+            "  date =" +
+            "    (SELECT date FROM" +
+            "        (SELECT date * 1000 AS date, thread_id FROM pdu" +
+            "         UNION SELECT date, thread_id FROM sms)" +
+            "     WHERE thread_id = " + thread_id + " ORDER BY date DESC LIMIT 1)" +
+            "  WHERE threads._id = " + thread_id + ";");
+        } catch (Throwable ex) {
+            Log.e(TAG, ex.getMessage(), ex);
+        }
+    }
+
+    public static void updateThreadsDate(SQLiteDatabase db, String where, String[] whereArgs) {
+        db.beginTransaction();
+        try {
+            if (where == null) {
+                where = "";
+            } else {
+                where = "WHERE (" + where + ")";
+            }
+            String query = "SELECT _id FROM threads " + where;
+            Cursor c = db.rawQuery(query, whereArgs);
+            if (c != null) {
+                try {
+                    Log.d(TAG, "updateThread count : " + c.getCount());
+                    while (c.moveToNext()) {
+                        updateThreadDate(db, c.getInt(0));
+                    }
+                } finally {
+                    c.close();
+                }
+            }
+            db.setTransactionSuccessful();
+        } catch (Throwable ex) {
+            Log.e(TAG, ex.getMessage(), ex);
+        } finally {
+            db.endTransaction();
+        }
+    }
+
     public static void updateAllThreads(SQLiteDatabase db, String where, String[] whereArgs) {
         db.beginTransaction();
         try {
@@ -452,6 +487,12 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
         createMmsTriggers(db);
         createWordsTables(db);
         createIndices(db);
+
+        SharedPreferences prefs = mContext.getSharedPreferences("migration", Context.MODE_PRIVATE);
+        if (!prefs.getBoolean("mms_phoneid_subid_conversion_done", false)
+                && migratePhoneIdToSubIdIfPossible(db)) {
+            prefs.edit().putBoolean("mms_phoneid_subid_conversion_done", true).apply();
+        }
     }
 
     // When upgrading the database we need to populate the words
@@ -548,7 +589,17 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
 
     private void createIndices(SQLiteDatabase db) {
         createThreadIdIndex(db);
+        createPduPartIndex(db);
     }
+
+    private void createPduPartIndex(SQLiteDatabase db) {
+        try {
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_part ON " + MmsProvider.TABLE_PART +
+                        " (mid);");
+        } catch (Exception ex) {
+            Log.e(TAG, "got exception creating indices: " + ex.toString());
+        }
+     }
 
     private void createThreadIdIndex(SQLiteDatabase db) {
         try {
@@ -594,6 +645,7 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                    Mms.DELIVERY_TIME + " INTEGER," +
                    Mms.DELIVERY_REPORT + " INTEGER," +
                    Mms.LOCKED + " INTEGER DEFAULT 0," +
+                   Mms.SUBSCRIPTION_ID + " INTEGER DEFAULT " + SubscriptionManager.INVALID_SUBSCRIPTION_ID + ", " +
                    Mms.PHONE_ID + " INTEGER DEFAULT -1, " +
                    Mms.SEEN + " INTEGER DEFAULT 0," +
                    Mms.CREATOR + " TEXT," +
@@ -671,9 +723,6 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
         db.execSQL("DROP TRIGGER IF EXISTS update_threads_on_update_part");
         db.execSQL(PART_UPDATE_THREADS_ON_UPDATE_TRIGGER);
 
-        db.execSQL("DROP TRIGGER IF EXISTS update_threads_on_delete_part");
-        db.execSQL(PART_UPDATE_THREADS_ON_DELETE_TRIGGER);
-
         db.execSQL("DROP TRIGGER IF EXISTS update_threads_on_update_pdu");
         db.execSQL(PDU_UPDATE_THREADS_ON_UPDATE_TRIGGER);
 
@@ -749,10 +798,6 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                 " SET index_text = NEW.text WHERE (source_id=NEW._id AND table_to_use=2); " +
                 " END;");
 
-        db.execSQL("DROP TRIGGER IF EXISTS mms_words_delete");
-        db.execSQL("CREATE TRIGGER mms_words_delete AFTER DELETE ON part BEGIN DELETE FROM " +
-                " words WHERE source_id = OLD._id AND table_to_use = 2; END;");
-
         // Updates threads table whenever a message in pdu is updated.
         db.execSQL("DROP TRIGGER IF EXISTS pdu_update_thread_date_subject_on_update");
         db.execSQL("CREATE TRIGGER pdu_update_thread_date_subject_on_update AFTER" +
@@ -760,18 +805,6 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                    "  ON " + MmsProvider.TABLE_PDU + " " +
                    PDU_UPDATE_THREAD_CONSTRAINTS +
                    PDU_UPDATE_THREAD_DATE_SNIPPET_COUNT_ON_UPDATE);
-
-        // Update threads table whenever a message in pdu is deleted
-        db.execSQL("DROP TRIGGER IF EXISTS pdu_update_thread_on_delete");
-        db.execSQL("CREATE TRIGGER pdu_update_thread_on_delete " +
-                   "AFTER DELETE ON pdu " +
-                   "BEGIN " +
-                   "  UPDATE threads SET " +
-                   "     date = (strftime('%s','now') * 1000)" +
-                   "  WHERE threads._id = old." + Mms.THREAD_ID + "; " +
-                   UPDATE_THREAD_COUNT_ON_OLD +
-                   UPDATE_THREAD_SNIPPET_SNIPPET_CS_ON_DELETE +
-                   "END;");
 
         // Updates threads table whenever a message is added to pdu.
         db.execSQL("DROP TRIGGER IF EXISTS pdu_update_thread_on_insert");
@@ -815,6 +848,9 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                    "  UPDATE threads SET error = error - 1" +
                    "  WHERE _id = OLD.thread_id; " +
                    "END;");
+        db.execSQL(TRIGGER_GET_UNREAD_COUNT_ON_INSERT);
+        db.execSQL(TRIGGER_GET_UNREAD_COUNT_ON_UPDATE);
+        db.execSQL(TRIGGER_GET_UNREAD_COUNT_ON_DELETE);
     }
 
     private void createSmsTables(SQLiteDatabase db) {
@@ -839,6 +875,7 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                    "body TEXT," +
                    "service_center TEXT," +
                    "locked INTEGER DEFAULT 0," +
+                   "sub_id INTEGER DEFAULT " + SubscriptionManager.INVALID_SUBSCRIPTION_ID + ", " +
                    "phone_id INTEGER DEFAULT -1, " +
                    "error_code INTEGER DEFAULT 0," +
                    "creator TEXT," +
@@ -858,6 +895,7 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                    "sequence INTEGER," + // the part number of this message
                    "destination_port INTEGER," +
                    "address TEXT," +
+                   "sub_id INTEGER DEFAULT " + SubscriptionManager.INVALID_SUBSCRIPTION_ID + ", " +
                    "phone_id INTEGER DEFAULT -1, " +
                    "pdu TEXT);"); // the raw PDU for this part
 
@@ -912,7 +950,9 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                    Threads.ARCHIVED + " INTEGER DEFAULT 0," +
                    Threads.TYPE + " INTEGER DEFAULT 0," +
                    Threads.ERROR + " INTEGER DEFAULT 0," +
-                   Threads.HAS_ATTACHMENT + " INTEGER DEFAULT 0);");
+                   Threads.HAS_ATTACHMENT + " INTEGER DEFAULT 0," +
+                   Threads.UNREAD_MESSAGE_COUNT + " INTEGER DEFAULT 0);"
+        );
 
         /**
          * This table stores the queue of messages to be sent/downloaded.
@@ -926,6 +966,8 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                    PendingMessages.ERROR_CODE + " INTEGER," +
                    PendingMessages.RETRY_INDEX + " INTEGER NOT NULL DEFAULT 0," +
                    PendingMessages.DUE_TIME + " INTEGER," +
+                   PendingMessages.SUBSCRIPTION_ID + " INTEGER DEFAULT " +
+                   SubscriptionManager.INVALID_SUBSCRIPTION_ID + ", " +
                    PendingMessages.PHONE_ID + " INTEGER DEFAULT 0, " +
                    PendingMessages.LAST_TRY + " INTEGER);");
 
@@ -1347,6 +1389,7 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
             } finally {
                 db.endTransaction();
             }
+            // fall through
         case 61:
             if (currentVersion <= 61) {
                 return;
@@ -1355,6 +1398,54 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
             db.beginTransaction();
             try {
                 upgradeDatabaseToVersion62(db);
+                db.setTransactionSuccessful();
+            } catch (Throwable ex) {
+                Log.e(TAG, ex.getMessage(), ex);
+                break;
+            } finally {
+                db.endTransaction();
+            }
+            // fall through
+        case 62:
+            if (currentVersion <= 62) {
+                return;
+            }
+
+            db.beginTransaction();
+            try {
+                upgradeDatabaseToVersion63(db);
+                db.setTransactionSuccessful();
+            } catch (Throwable ex) {
+                Log.e(TAG, ex.getMessage(), ex);
+                break;
+            } finally {
+                db.endTransaction();
+            }
+            // fall through
+        case 63:
+            if (currentVersion <= 63) {
+                return;
+            }
+
+            db.beginTransaction();
+            try {
+                upgradeDatabaseToVersion64(db);
+                db.setTransactionSuccessful();
+            } catch (Throwable ex) {
+                Log.e(TAG, ex.getMessage(), ex);
+                break;
+            } finally {
+                db.endTransaction();
+            }
+            // fall through
+        case 64:
+            if (currentVersion <= 64) {
+                return;
+            }
+
+            db.beginTransaction();
+            try {
+                upgradeDatabaseToVersion65(db);
                 db.setTransactionSuccessful();
             } catch (Throwable ex) {
                 Log.e(TAG, ex.getMessage(), ex);
@@ -1415,9 +1506,8 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
 
         updateThreadsAttachmentColumn(db);
 
-        // Add insert and delete triggers for keeping it up to date.
+        // Add insert triggers for keeping it up to date.
         db.execSQL(PART_UPDATE_THREADS_ON_INSERT_TRIGGER);
-        db.execSQL(PART_UPDATE_THREADS_ON_DELETE_TRIGGER);
     }
 
     private void upgradeDatabaseToVersion44(SQLiteDatabase db) {
@@ -1579,6 +1669,7 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                 + Mms.CREATOR + " TEXT");
         db.execSQL("ALTER TABLE " + SmsProvider.TABLE_SMS +" ADD COLUMN "
                 + Sms.CREATOR + " TEXT");
+
         // If there is no "phone_id" column in sms table, this means the database
         // may come from an KK platform, whose version is already 58.
         if (!isColumnExist(db, SmsProvider.TABLE_SMS, Sms.PHONE_ID)) {
@@ -1607,6 +1698,75 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
         }
     }
 
+    private void upgradeDatabaseToVersion62(SQLiteDatabase db) {
+        if (isCM11DB(db)) {
+            // CM11 was 60, which means we skipped a few updates...
+            try {
+                upgradeDatabaseToVersion58(db);
+            } catch (Exception e) { }
+            try {
+                upgradeDatabaseToVersion59(db);
+            } catch (Exception e) { }
+            try {
+                upgradeDatabaseToVersion60(db);
+            } catch (Exception e) { }
+            try {
+                upgradeDatabaseToVersion61(db);
+            } catch (Exception e) { }
+        }
+    }
+
+    private void upgradeDatabaseToVersion63(SQLiteDatabase db) {
+        // Improve the performance of deleting Mms.
+        db.execSQL("DROP TRIGGER IF EXISTS update_threads_on_delete_part");
+        db.execSQL("DROP TRIGGER IF EXISTS mms_words_delete");
+        db.execSQL("DROP TRIGGER IF EXISTS pdu_update_thread_on_delete");
+    }
+
+    private void upgradeDatabaseToVersion64(SQLiteDatabase db) {
+        try {
+            db.execSQL("ALTER TABLE " + MmsProvider.TABLE_PDU +" ADD COLUMN "
+                    + Mms.SUBSCRIPTION_ID + " INTEGER DEFAULT -1");
+        } catch (SQLiteException e) {
+            // ignore (DB was older than version 58), we'll remove the data later
+        }
+        db.execSQL("ALTER TABLE " + MmsSmsProvider.TABLE_PENDING_MSG +" ADD COLUMN "
+                + "pending_sub_id" + " INTEGER DEFAULT 0");
+        try {
+            db.execSQL("ALTER TABLE " + SmsProvider.TABLE_SMS +" ADD COLUMN "
+                    + Sms.SUBSCRIPTION_ID + " INTEGER DEFAULT -1");
+        } catch (SQLiteException e) {
+            // see above
+        }
+        try {
+            db.execSQL("ALTER TABLE " + SmsProvider.TABLE_RAW +" ADD COLUMN "
+                    + Sms.SUBSCRIPTION_ID + " INTEGER DEFAULT -1");
+        } catch (SQLiteException e) {
+            // see above
+        }
+        // remove old data from the sub_id column (if present), it was already copied
+        // over to the phone_id column in upgradeDatabaseToVersion59
+        db.execSQL("UPDATE " + MmsProvider.TABLE_PDU + " SET " + Mms.SUBSCRIPTION_ID + " = -1");
+        db.execSQL("UPDATE " + SmsProvider.TABLE_SMS + " SET " + Sms.SUBSCRIPTION_ID + " = -1");
+        db.execSQL("UPDATE " + SmsProvider.TABLE_RAW + " SET " + Sms.SUBSCRIPTION_ID + " = -1");
+    }
+
+    private void upgradeDatabaseToVersion65(SQLiteDatabase db) {
+
+        try {
+            db.execSQL("ALTER TABLE " + MmsSmsProvider.TABLE_THREADS + " ADD COLUMN "
+            + Threads.UNREAD_MESSAGE_COUNT + " INTEGER DEFAULT 0");
+        } catch (SQLiteException e) {
+            // consume since we have nothing to do
+        }
+
+        // Add triggers to keep record up to date
+        db.execSQL(TRIGGER_GET_UNREAD_COUNT_ON_INSERT);
+        db.execSQL(TRIGGER_GET_UNREAD_COUNT_ON_UPDATE);
+        db.execSQL(TRIGGER_GET_UNREAD_COUNT_ON_DELETE);
+
+    }
+
     // Try to copy data from existing src column to new column which supposed
     // to be added before calling this functin.
     // If src or dest column not exsit, it will just bail out.
@@ -1633,24 +1793,6 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
             }
         }
         return false;
-    }
-
-    private void upgradeDatabaseToVersion62(SQLiteDatabase db) {
-        if (isCM11DB(db)) {
-           // CM11 was 60, which means we skipped a few updates...
-           try {
-               upgradeDatabaseToVersion58(db);
-           } catch (Exception e) { }
-           try {
-               upgradeDatabaseToVersion59(db);
-           } catch (Exception e) { }
-           try {
-               upgradeDatabaseToVersion60(db);
-           } catch (Exception e) { }
-           try {
-               upgradeDatabaseToVersion61(db);
-           } catch (Exception e) { }
-        }
     }
 
     @Override
@@ -1930,7 +2072,8 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
                 Mms.DELIVERY_TIME + " INTEGER," +
                 Mms.DELIVERY_REPORT + " INTEGER," +
                 Mms.LOCKED + " INTEGER DEFAULT 0," +
-                Mms.PHONE_ID + " INTEGER DEFAULT -1," +
+                Mms.SUBSCRIPTION_ID + " INTEGER DEFAULT " + SubscriptionManager.INVALID_SUBSCRIPTION_ID + ", " +
+                Mms.PHONE_ID + " INTEGER DEFAULT -1, " +
                 Mms.SEEN + " INTEGER DEFAULT 0," +
                 Mms.TEXT_ONLY + " INTEGER DEFAULT 0" +
                 ");");
@@ -1970,14 +2113,49 @@ public class MmsSmsDatabaseHelper extends SQLiteOpenHelper {
 
     // Determine whether this database has CM11 columns...
     private boolean isCM11DB(SQLiteDatabase db) {
-        boolean result = false;
+        Cursor c = null;
         try {
-            String query = "SELECT sub_id, pri FROM sms";
-            Cursor c = db.rawQuery(query, null);
+            final String query = "SELECT sub_id, pri FROM sms";
+            c = db.rawQuery(query, null);
+        } catch (Exception e) {
+        } finally {
             if (c != null) {
-                result = true;
+                c.close();
             }
-        } catch (Exception e) {}
-        return result;
+        }
+        return c != null;
+    }
+
+    private boolean migratePhoneIdToSubIdIfPossible(SQLiteDatabase db) {
+        boolean migratedAnyData = false;
+        Cursor simCursor = mContext.getContentResolver().query(SubscriptionManager.CONTENT_URI,
+                new String[] {
+                    SubscriptionManager.UNIQUE_KEY_SUBSCRIPTION_ID,
+                    SubscriptionManager.SIM_SLOT_INDEX
+                }, null, null, SubscriptionManager.UNIQUE_KEY_SUBSCRIPTION_ID + " ASC");
+        if (simCursor != null) {
+            try {
+                simCursor.moveToFirst();
+                while (!simCursor.isAfterLast()) {
+                    int subId = simCursor.getInt(0);
+                    int phoneId = simCursor.getInt(1);
+                    db.execSQL("UPDATE " + MmsProvider.TABLE_PDU + " SET " + Mms.SUBSCRIPTION_ID
+                            + " = " + subId + " WHERE " + Mms.PHONE_ID + " = " + phoneId + " AND "
+                            + Mms.SUBSCRIPTION_ID + " <= 0");
+                    db.execSQL("UPDATE " + SmsProvider.TABLE_SMS + " SET " + Sms.SUBSCRIPTION_ID
+                            + " = " + subId + " WHERE " + Sms.PHONE_ID + " = " + phoneId + " AND "
+                            + Sms.SUBSCRIPTION_ID + " <= 0");
+                    db.execSQL("UPDATE " + SmsProvider.TABLE_RAW + " SET " + Sms.SUBSCRIPTION_ID
+                            + " = " + subId + " WHERE " + Sms.PHONE_ID + " = " + phoneId + " AND "
+                            + Sms.SUBSCRIPTION_ID + " <= 0");
+                    migratedAnyData = true;
+                    simCursor.moveToNext();
+                }
+            } finally {
+                simCursor.close();
+            }
+        }
+
+        return migratedAnyData;
     }
 }
